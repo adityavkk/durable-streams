@@ -4,10 +4,21 @@ import { DurableStream } from "@durable-streams/client"
 import { and, eq, gt, useLiveQuery } from "@tanstack/react-db"
 import { useStreamDB } from "../lib/stream-db-context"
 import { usePresence } from "../hooks/usePresence"
+import { registryStateSchema } from "../lib/schemas"
 import type { StreamMetadata } from "../lib/schemas"
 import "../styles.css"
 
 const SERVER_URL = `http://${window.location.hostname}:4437`
+
+// Servers without a registry lifecycle hook (e.g. non-dev-server
+// implementations) never write to __registry__ themselves, so the UI
+// records stream creation/deletion directly.
+function registryWriter() {
+  return new DurableStream({
+    url: `${SERVER_URL}/v1/stream/__registry__`,
+    contentType: `application/json`,
+  })
+}
 
 function StreamListItem({ stream }: { stream: StreamMetadata }) {
   const { presenceDB } = useStreamDB()
@@ -105,11 +116,24 @@ function RootLayout() {
 
     try {
       setError(null)
-      // Create the actual stream - server registry hook will update __registry__
       await DurableStream.create({
         url: `${SERVER_URL}/v1/stream/${newStreamPath}`,
         contentType: newStreamContentType,
       })
+
+      // Record it in the registry ourselves (no server-side hook needed).
+      await registryWriter().append(
+        JSON.stringify(
+          registryStateSchema.streams.upsert({
+            value: {
+              path: newStreamPath,
+              contentType: newStreamContentType,
+              createdAt: Date.now(),
+            },
+            headers: { txid: crypto.randomUUID() },
+          })
+        )
+      )
 
       setNewStreamPath(``)
     } catch (err: any) {
@@ -131,8 +155,17 @@ function RootLayout() {
       const stream = new DurableStream({
         url: `${SERVER_URL}/v1/stream/${path}`,
       })
-      // Delete the stream - server registry hook will update __registry__
       await stream.delete()
+
+      // Remove it from the registry ourselves (no server-side hook needed).
+      await registryWriter().append(
+        JSON.stringify(
+          registryStateSchema.streams.delete({
+            key: path,
+            headers: { txid: crypto.randomUUID() },
+          })
+        )
+      )
     } catch (err: any) {
       setError(`Failed to delete stream: ${err.message}`)
     }

@@ -184,12 +184,13 @@ export function StreamDBProvider({ children }: { children: ReactNode }) {
         url: `${SERVER_URL}/v1/stream/__registry__`,
       })
 
-      // Check if registry exists, create it if it doesn't
+      // Check if registry exists, create it if it doesn't.
+      // Note: head() resolves with { exists: false } rather than throwing.
       const registryExists = await registryStream.head().catch(() => null)
 
       if (cancelled) return
 
-      if (!registryExists) {
+      if (!registryExists?.exists) {
         await DurableStream.create({
           url: `${SERVER_URL}/v1/stream/__registry__`,
           contentType: `application/json`,
@@ -208,7 +209,7 @@ export function StreamDBProvider({ children }: { children: ReactNode }) {
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       if (cancelled) return
 
-      if (!presenceExists) {
+      if (!presenceExists?.exists) {
         await DurableStream.create({
           url: `${SERVER_URL}/v1/stream/__presence__`,
           contentType: `application/json`,
