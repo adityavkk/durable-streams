@@ -2951,6 +2951,121 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       expect(headResponse.status).toBe(200)
     })
 
+    test.concurrent(
+      `should extend TTL on GET ?offset=now (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-offset-now`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Non-live tail read — a read, so it should reset the TTL
+        const nowResponse = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=now`
+        )
+        expect(nowResponse.status).toBe(200)
+        expect(nowResponse.headers.get(`Stream-Up-To-Date`)).toBe(`true`)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the read
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the offset=now read)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+      }
+    )
+
+    test.concurrent(
+      `should extend TTL on close-only POST (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-close`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Close-only POST (empty body) — a write, so it should reset the TTL
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Stream-Closed": `true` },
+        })
+        expect(closeResponse.status).toBe(204)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the close
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the close)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(`Stream-Closed`)).toBe(`true`)
+      }
+    )
+
+    test.concurrent(
+      `should extend TTL on producer close-only POST (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-producer-close`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Producer close-only POST — a write, so it should reset the TTL
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Stream-Closed": `true`,
+            "Producer-Id": `ttl-close-producer`,
+            "Producer-Epoch": `0`,
+            "Producer-Seq": `0`,
+          },
+        })
+        expect(closeResponse.status).toBe(204)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the close
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the close)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(`Stream-Closed`)).toBe(`true`)
+      }
+    )
+
     test.concurrent(`should extend TTL on read (sliding window)`, async () => {
       const streamPath = uniquePath(`ttl-renew-read`)
 
@@ -3107,6 +3222,26 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       // 304 should have empty body
       const text = await response2.text()
       expect(text).toBe(``)
+    })
+
+    test(`should allow If-None-Match in CORS preflight responses`, async () => {
+      const streamPath = `/v1/stream/etag-preflight-test-${Date.now()}`
+
+      // Preflight for a conditional cross-origin GET
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `OPTIONS`,
+        headers: {
+          Origin: `https://example.com`,
+          "Access-Control-Request-Method": `GET`,
+          "Access-Control-Request-Headers": `if-none-match`,
+        },
+      })
+
+      expect([200, 204]).toContain(response.status)
+      const allowHeaders = response.headers.get(`access-control-allow-headers`)
+      expect(allowHeaders).toBeDefined()
+      // A wildcard also satisfies non-credentialed preflights
+      expect(allowHeaders!.toLowerCase()).toMatch(/if-none-match|\*/)
     })
 
     test(`should return 200 for non-matching If-None-Match`, async () => {
@@ -3468,6 +3603,135 @@ export function runConformanceTests(options: ConformanceTestOptions): void {
       // Verify SSE format: should contain event: and data: lines
       expect(received).toContain(`event:`)
       expect(received).toContain(`data:`)
+    })
+
+    test(`JSON SSE catch-up pairs every data event with a control event`, async () => {
+      const streamPath = `/v1/stream/sse-json-framing-test-${Date.now()}`
+
+      // Two separate appends buffered BEFORE the SSE subscription opens,
+      // so the catch-up read returns a multi-message batch.
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"n":1}]`,
+      })
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"n":2}]`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `upToDate` }
+      )
+      expect(response.status).toBe(200)
+
+      // Parse raw SSE frames into (event, payload) pairs, stopping at the
+      // first control event that reports the client caught up.
+      const frames: Array<{ event: string; payload: string }> = []
+      for (const block of received.split(`\n\n`)) {
+        const lines = block.split(`\n`)
+        const eventLine = lines.find((l) => l.startsWith(`event:`))
+        if (!eventLine) continue
+        const payload = lines
+          .filter((l) => l.startsWith(`data:`))
+          .map((l) => l.slice(5).replace(/^ /, ``))
+          .join(`\n`)
+        frames.push({ event: eventLine.slice(6).trim(), payload })
+        if (
+          eventLine.slice(6).trim() === `control` &&
+          (payload.includes(`upToDate`) || payload.includes(`streamClosed`))
+        ) {
+          break
+        }
+      }
+
+      // §5.8: a control event follows EVERY data event. Multiple data
+      // events sharing one control boundary would make JSON catch-up
+      // unparseable for clients that collect data up to the control.
+      const dataFrames = frames.filter((f) => f.event === `data`)
+      expect(dataFrames.length).toBeGreaterThan(0)
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i]!.event === `data`) {
+          expect(frames[i + 1]?.event).toBe(`control`)
+        }
+      }
+
+      // Each data event must be a complete, independently parseable JSON
+      // value, and together they must carry exactly the appended values.
+      const values: Array<unknown> = []
+      for (const frame of dataFrames) {
+        const parsed: unknown = JSON.parse(frame.payload)
+        expect(Array.isArray(parsed)).toBe(true)
+        values.push(...(parsed as Array<unknown>))
+      }
+      expect(values).toEqual([{ n: 1 }, { n: 2 }])
+    })
+
+    test(`base64 SSE catch-up pairs every data event with a control event`, async () => {
+      const streamPath = `/v1/stream/sse-base64-framing-test-${Date.now()}`
+
+      // Two separate binary appends buffered BEFORE the SSE subscription
+      // opens, so the catch-up read returns a multi-message batch.
+      const partOne = new Uint8Array([0, 1, 2, 3])
+      const partTwo = new Uint8Array([4, 5, 6, 7])
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: partOne,
+      })
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: partTwo,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `upToDate` }
+      )
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`stream-sse-data-encoding`)).toBe(`base64`)
+
+      const frames: Array<{ event: string; payload: string }> = []
+      for (const block of received.split(`\n\n`)) {
+        const lines = block.split(`\n`)
+        const eventLine = lines.find((l) => l.startsWith(`event:`))
+        if (!eventLine) continue
+        const payload = lines
+          .filter((l) => l.startsWith(`data:`))
+          .map((l) => l.slice(5).replace(/^ /, ``))
+          .join(`\n`)
+        frames.push({ event: eventLine.slice(6).trim(), payload })
+        if (
+          eventLine.slice(6).trim() === `control` &&
+          (payload.includes(`upToDate`) || payload.includes(`streamClosed`))
+        ) {
+          break
+        }
+      }
+
+      // §5.8: a control event follows EVERY data event, and each data
+      // event's payload must independently base64-decode — two padded
+      // base64 strings concatenated across a control boundary don't.
+      const dataFrames = frames.filter((f) => f.event === `data`)
+      expect(dataFrames.length).toBeGreaterThan(0)
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i]!.event === `data`) {
+          expect(frames[i + 1]?.event).toBe(`control`)
+        }
+      }
+
+      const decoded: Array<Buffer> = []
+      for (const frame of dataFrames) {
+        const cleaned = frame.payload.replace(/[\n\r]/g, ``)
+        expect(cleaned.length % 4).toBe(0)
+        decoded.push(Buffer.from(cleaned, `base64`))
+      }
+      expect(new Uint8Array(Buffer.concat(decoded))).toEqual(
+        new Uint8Array([...partOne, ...partTwo])
+      )
     })
 
     test(`should send control events with offset`, async () => {

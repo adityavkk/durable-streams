@@ -157,8 +157,15 @@ func (s *MemoryStore) Create(path string, opts CreateOptions) (*StreamMetadata, 
 	// Check if stream already exists
 	if existing, ok := s.streams[path]; ok {
 		if existing.metadata.IsExpired() {
-			// Expired: delete and proceed with creation
-			delete(s.streams, path)
+			// Expiry is a logical delete: keep pinned parents available to forks,
+			// and release a fork's parent edge when it can be collected.
+			if existing.metadata.RefCount > 0 {
+				existing.metadata.SoftDeleted = true
+				return nil, false, ErrStreamExists
+			}
+			if err := s.deleteWithCascade(path); err != nil {
+				return nil, false, err
+			}
 		} else if existing.metadata.SoftDeleted {
 			// Soft-deleted streams block new creation
 			return nil, false, ErrStreamExists
@@ -459,6 +466,9 @@ func (s *MemoryStore) CloseStream(path string) (*CloseResult, error) {
 	alreadyClosed := stream.metadata.Closed
 	stream.metadata.Closed = true
 
+	// A close is a write: refresh the TTL sliding window
+	stream.metadata.LastAccessedAt = time.Now()
+
 	// Notify pending long-polls that stream is closed
 	s.longPoll.notifyClosed(path)
 
@@ -550,6 +560,9 @@ func (s *MemoryStore) CloseStreamWithProducer(path string, opts CloseProducerOpt
 		Epoch:      opts.ProducerEpoch,
 		Seq:        opts.ProducerSeq,
 	}
+
+	// A close is a write: refresh the TTL sliding window
+	stream.metadata.LastAccessedAt = time.Now()
 
 	// Notify pending long-polls that stream is closed
 	s.longPoll.notifyClosed(path)
